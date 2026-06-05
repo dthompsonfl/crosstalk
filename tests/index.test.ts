@@ -160,7 +160,7 @@ describe('crosstalk plugin', () => {
 
     await hooks.config?.(config as never);
 
-    expect(config.command?.crosstalk?.description).toBe('Join or leave the crosstalk room');
+    expect(config.command?.crosstalk?.description).toBe('Crosstalk: messaging, pipelines, and task coordination');
     expect(config.command?.crosstalk?.template).toBe('$ARGUMENTS');
     expect(config.experimental?.subagent_tools).toContain('broadcast');
   });
@@ -262,7 +262,7 @@ describe('crosstalk plugin', () => {
 
     expect(prompts[0].body.parts[0]).toEqual({
       type: 'text',
-      text: 'You are: beta\nRoom: default\nOpen messages: 0\n\nOther joined sessions:\n- alpha (idle)\n  -> reviewing migrations',
+      text: 'You are beta in room default.\n\nOpen messages: 0\n\nOther joined sessions:\n- alpha (idle)\n  -> reviewing migrations',
       ignored: true,
     });
   });

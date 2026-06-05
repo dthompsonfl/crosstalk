@@ -2,7 +2,20 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import type { HandledMessage, LocalSession, RoomView, SharedMessage, SharedRoom, SharedSession, WakeCandidate } from './types';
+import type {
+  BatchedQuestion,
+  HandledMessage,
+  LocalSession,
+  Pipeline,
+  PipelineState,
+  RoomView,
+  SharedMessage,
+  SharedRoom,
+  SharedSession,
+  Task,
+  TaskState,
+  WakeCandidate,
+} from './types';
 import { DEFAULT_ROOM, MAX_MESSAGE_LENGTH, MAX_STATUS_LENGTH, normalizeMessage } from './prompts';
 
 const LOCK_STALE_MS = 10000;
@@ -26,9 +39,10 @@ function lockDir(): string {
 
 function emptyRoom(): SharedRoom {
   return {
-    version: 1,
+    version: 2,
     sessions: {},
     messages: [],
+    pipelines: {},
   };
 }
 
@@ -120,10 +134,24 @@ async function readRoomFile(): Promise<SharedRoom> {
 
   try {
     const text = await fs.readFile(roomFile(), 'utf8');
-    const parsed = JSON.parse(text) as SharedRoom;
-    if (parsed.version !== 1 || typeof parsed.sessions !== 'object' || !Array.isArray(parsed.messages)) {
+    const raw = JSON.parse(text) as Record<string, unknown>;
+
+    // Migrate version 1 → 2
+    if (raw.version === 1) {
+      raw.pipelines = {};
+      raw.version = 2;
+    }
+
+    const parsed = raw as unknown as SharedRoom;
+
+    if (parsed.version !== 2 || typeof parsed.sessions !== 'object' || !Array.isArray(parsed.messages)) {
       return emptyRoom();
     }
+
+    if (typeof parsed.pipelines !== 'object') {
+      parsed.pipelines = {};
+    }
+
     for (const session of Object.values(parsed.sessions)) {
       session.room = cleanRoom(session.room);
     }
@@ -461,5 +489,251 @@ export async function syncLocalSessions(local: Map<string, LocalSession>): Promi
     }
 
     return wake;
+  });
+}
+
+// === Pipeline CRUD ===
+
+function nextId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+export async function createPipeline(
+  sessionId: string,
+  title: string,
+  context: Record<string, unknown> = {},
+): Promise<Pipeline> {
+  return mutateRoom((room) => {
+    const now = roomNow();
+    const pipeline: Pipeline = {
+      id: nextId(),
+      title: cleanName(title),
+      creatorSessionId: sessionId,
+      state: 'planning',
+      tasks: {},
+      questions: [],
+      context,
+      createdAt: now,
+      updatedAt: now,
+    };
+    room.pipelines[pipeline.id] = pipeline;
+    return pipeline;
+  });
+}
+
+export async function getPipeline(pipelineId: string): Promise<Pipeline | undefined> {
+  const room = await readRoomFile();
+  return room.pipelines[pipelineId];
+}
+
+export async function getPipelinesBySession(sessionId: string): Promise<Pipeline[]> {
+  const room = await readRoomFile();
+  return Object.values(room.pipelines).filter((pipeline) => {
+    if (pipeline.creatorSessionId === sessionId) return true;
+    return Object.values(pipeline.tasks).some((task) => task.assignee && task.assignee === sessionId);
+  });
+}
+
+export async function addTaskToPipeline(
+  pipelineId: string,
+  task: Omit<Task, 'id' | 'state' | 'createdAt'>,
+): Promise<Task> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const now = roomNow();
+    const newTask: Task = {
+      ...task,
+      id: nextId(),
+      state: 'pending',
+      createdAt: now,
+    };
+    pipeline.tasks[newTask.id] = newTask;
+    pipeline.updatedAt = now;
+    return newTask;
+  });
+}
+
+export async function claimTask(
+  pipelineId: string,
+  taskId: string,
+  sessionAlias: string,
+): Promise<Task> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const task = pipeline.tasks[taskId];
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    if (task.state !== 'pending') {
+      throw new Error(`Task ${taskId} is not pending (state: ${task.state})`);
+    }
+
+    const now = roomNow();
+    task.state = 'claimed';
+    task.assignee = sessionAlias;
+    task.claimedAt = now;
+    pipeline.updatedAt = now;
+    return task;
+  });
+}
+
+export async function updateTask(
+  pipelineId: string,
+  taskId: string,
+  updates: {
+    state?: TaskState;
+    output?: Record<string, unknown>;
+    filesChanged?: string[];
+    error?: string;
+  },
+): Promise<Task> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const task = pipeline.tasks[taskId];
+    if (!task) {
+      throw new Error(`Task ${taskId} not found`);
+    }
+
+    const now = roomNow();
+    if (updates.state) task.state = updates.state;
+    if (updates.output) task.output = updates.output;
+    if (updates.filesChanged) task.filesChanged = updates.filesChanged;
+    if (updates.error) task.error = updates.error;
+    if (updates.state === 'done') task.completedAt = now;
+    pipeline.updatedAt = now;
+    return task;
+  });
+}
+
+export async function addQuestion(
+  pipelineId: string,
+  taskId: string,
+  question: string,
+  context: string,
+  options?: string[],
+): Promise<BatchedQuestion> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const now = roomNow();
+    const q: BatchedQuestion = {
+      id: nextId(),
+      taskId,
+      question,
+      context,
+      options,
+      askedAt: now,
+    };
+    pipeline.questions.push(q);
+    pipeline.updatedAt = now;
+    return q;
+  });
+}
+
+export async function answerQuestion(
+  pipelineId: string,
+  questionId: string,
+  answer: string,
+): Promise<BatchedQuestion> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const q = pipeline.questions.find((item) => item.id === questionId);
+    if (!q) {
+      throw new Error(`Question ${questionId} not found`);
+    }
+
+    const now = roomNow();
+    q.answer = answer;
+    q.answeredAt = now;
+    pipeline.updatedAt = now;
+    return q;
+  });
+}
+
+export async function getPendingQuestions(pipelineId: string): Promise<BatchedQuestion[]> {
+  const room = await readRoomFile();
+  const pipeline = room.pipelines[pipelineId];
+  if (!pipeline) return [];
+  return pipeline.questions.filter((q) => !q.answer);
+}
+
+export function getReadyTasks(pipeline: Pipeline): Task[] {
+  return Object.values(pipeline.tasks).filter((task) => {
+    if (task.state !== 'pending') return false;
+    return task.dependsOn.every((depId) => {
+      const dep = pipeline.tasks[depId];
+      return dep?.state === 'done';
+    });
+  });
+}
+
+export async function advancePipeline(pipelineId: string): Promise<Pipeline> {
+  return mutateRoom((room) => {
+    const pipeline = room.pipelines[pipelineId];
+    if (!pipeline) {
+      throw new Error(`Pipeline ${pipelineId} not found`);
+    }
+
+    const now = roomNow();
+    pipeline.updatedAt = now;
+
+    // If in planning and has tasks, move to questions or running
+    if (pipeline.state === 'planning') {
+      const hasTasks = Object.keys(pipeline.tasks).length > 0;
+      if (!hasTasks) return pipeline;
+
+      const unanswered = pipeline.questions.filter((q) => !q.answer);
+      if (unanswered.length > 0) {
+        pipeline.state = 'questions';
+      } else {
+        pipeline.state = 'running';
+      }
+      return pipeline;
+    }
+
+    // If in questions and all answered, move to running
+    if (pipeline.state === 'questions') {
+      const unanswered = pipeline.questions.filter((q) => !q.answer);
+      if (unanswered.length === 0) {
+        pipeline.state = 'running';
+      }
+      return pipeline;
+    }
+
+    // If running, check if all tasks done or any failed
+    if (pipeline.state === 'running') {
+      const tasks = Object.values(pipeline.tasks);
+      const anyFailed = tasks.some((t) => t.state === 'failed');
+      const allDone = tasks.every((t) => t.state === 'done');
+
+      if (anyFailed) {
+        pipeline.state = 'failed';
+      } else if (allDone) {
+        pipeline.state = 'done';
+      }
+      return pipeline;
+    }
+
+    return pipeline;
   });
 }

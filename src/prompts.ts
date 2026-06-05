@@ -1,6 +1,6 @@
 // This file owns the user-visible strings and synthetic prompt content for crosstalk.
 
-import type { HandledMessage, SharedMessage, SharedSession, UserMessage } from './types';
+import type { BatchedQuestion, HandledMessage, Pipeline, SharedMessage, SharedSession, Task, UserMessage } from './types';
 
 const DEFAULT_MODEL_ID = 'unknown';
 const DEFAULT_PROVIDER_ID = 'unknown';
@@ -13,6 +13,8 @@ export const SYSTEM_PROMPT = `<instructions tool="crosstalk">
 # Crosstalk
 
 You are joined to a shared crosstalk room.
+
+## Messaging
 
 Use \`broadcast\` to communicate with other joined sessions:
 - \`broadcast(message="...")\` updates your visible status
@@ -29,6 +31,20 @@ Messages arrive as a synthetic \`broadcast\` tool result with this shape:
 \`\`\`
 
 When you receive a direct message, answer with \`broadcast(reply_to=<id>, message="...")\` or send a new direct message with \`send_to\`.
+
+## Pipelines
+
+You can create and manage autonomous feature pipelines:
+
+- \`pipeline(action="create", title="...")\` — start a new pipeline
+- \`pipeline(action="status")\` — check pipeline progress
+- \`task(action="create", pipeline_id="...", title="...", role="builder", ...)\` — add a task
+- \`task(action="claim", pipeline_id="...", task_id="...")\` — pick up work
+- \`task(action="complete", pipeline_id="...", task_id="...", output={...})\` — finish work
+- \`question(action="ask", pipeline_id="...", task_id="...", question="...", context="...")\` — ask the user
+- \`question(action="answer", pipeline_id="...", question_id="...", answer="...")\` — answer a question
+
+When you receive a task assignment via broadcast, claim it, do the work, then complete with structured output.
 </instructions>`;
 
 export const BROADCAST_DESCRIPTION =
@@ -65,7 +81,7 @@ export function joinResult(self: string, room: string, peers: SharedSession[], m
 }
 
 export function statusResult(self: string, room: string, peers: SharedSession[], messages: SharedMessage[]): string {
-  const lines = [`You are: ${self}`, `Room: ${room}`, `Open messages: ${messages.length}`, ''];
+  const lines = [`You are ${self} in room ${room}.`, '', `Open messages: ${messages.length}`, ''];
   lines.push(...peerLines(peers));
   return lines.join('\n');
 }
@@ -219,4 +235,155 @@ export function createInboxMessage(
   };
 
   return assistant;
+}
+
+// === Pipeline Result Formatters ===
+
+export function pipelineCreatedResult(pipeline: Pipeline): string {
+  const lines = [
+    `Pipeline created: ${pipeline.title}`,
+    `ID: ${pipeline.id}`,
+    `State: ${pipeline.state}`,
+    '',
+    'Add tasks with task(action="create", ...) then start with pipeline(action="start").',
+  ];
+  return lines.join('\n');
+}
+
+export function pipelineStatusResult(pipeline: Pipeline): string {
+  const lines = [
+    `Pipeline: ${pipeline.title}`,
+    `ID: ${pipeline.id}`,
+    `State: ${pipeline.state}`,
+    `Created: ${new Date(pipeline.createdAt).toISOString()}`,
+    '',
+  ];
+
+  const tasks = Object.values(pipeline.tasks);
+  if (tasks.length === 0) {
+    lines.push('No tasks yet.');
+  } else {
+    lines.push(`Tasks (${tasks.length}):`);
+    for (const task of tasks) {
+      const status = task.state === 'done' ? 'done' : task.state === 'failed' ? 'FAILED' : task.state;
+      const assignee = task.assignee ? ` → ${task.assignee}` : '';
+      const deps = task.dependsOn.length > 0 ? ` [deps: ${task.dependsOn.join(', ')}]` : '';
+      lines.push(`  - [${status}] ${task.title} (${task.role})${assignee}${deps}`);
+    }
+  }
+
+  const unanswered = pipeline.questions.filter((q) => !q.answer);
+  if (unanswered.length > 0) {
+    lines.push('', `Pending questions: ${unanswered.length}`);
+  }
+
+  return lines.join('\n');
+}
+
+export function taskCreatedResult(task: Task, pipelineTitle: string): string {
+  const lines = [
+    `Task created in "${pipelineTitle}":`,
+    `  ID: ${task.id}`,
+    `  Title: ${task.title}`,
+    `  Role: ${task.role}`,
+    `  State: ${task.state}`,
+  ];
+  if (task.dependsOn.length > 0) {
+    lines.push(`  Depends on: ${task.dependsOn.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+export function taskClaimedResult(task: Task): string {
+  return `Task claimed: "${task.title}" (ID: ${task.id})\nYou are now assigned. Do the work, then call task(action="complete") with your results.`;
+}
+
+export function taskCompletedResult(task: Task): string {
+  const files = task.filesChanged && task.filesChanged.length > 0
+    ? `\nFiles changed: ${task.filesChanged.join(', ')}`
+    : '';
+  return `Task completed: "${task.title}"${files}`;
+}
+
+export function taskFailedResult(task: Task): string {
+  return `Task failed: "${task.title}"\nError: ${task.error || 'Unknown error'}`;
+}
+
+export function questionAskedResult(q: BatchedQuestion): string {
+  const lines = [
+    `Question added to pipeline:`,
+    `  "${q.question}"`,
+    `  Context: ${q.context}`,
+  ];
+  if (q.options && q.options.length > 0) {
+    lines.push(`  Options: ${q.options.join(' | ')}`);
+  }
+  lines.push('', 'Answer with question(action="answer", ...)');
+  return lines.join('\n');
+}
+
+export function questionBatchResult(questions: BatchedQuestion[]): string {
+  if (questions.length === 0) {
+    return 'No pending questions.';
+  }
+
+  const lines = [`Pending questions (${questions.length}):`];
+  for (const q of questions) {
+    lines.push('');
+    lines.push(`  #${q.id} (task: ${q.taskId})`);
+    lines.push(`  Q: ${q.question}`);
+    lines.push(`  Context: ${q.context}`);
+    if (q.options && q.options.length > 0) {
+      lines.push(`  Options: ${q.options.join(' | ')}`);
+    }
+  }
+  lines.push('', 'Answer each with question(action="answer", pipeline_id="...", question_id="...", answer="...")');
+  return lines.join('\n');
+}
+
+export function pipelineCompleteResult(pipeline: Pipeline): string {
+  const tasks = Object.values(pipeline.tasks);
+  const done = tasks.filter((t) => t.state === 'done').length;
+  const failed = tasks.filter((t) => t.state === 'failed').length;
+
+  const lines = [
+    `Pipeline complete: ${pipeline.title}`,
+    `ID: ${pipeline.id}`,
+    `Result: ${failed > 0 ? `${failed} task(s) failed` : 'All tasks completed'}`,
+    '',
+    `Tasks: ${done}/${tasks.length} done`,
+  ];
+
+  for (const task of tasks) {
+    const icon = task.state === 'done' ? 'done' : 'FAILED';
+    const files = task.filesChanged && task.filesChanged.length > 0 ? ` (${task.filesChanged.length} files)` : '';
+    lines.push(`  - [${icon}] ${task.title}${files}`);
+  }
+
+  return lines.join('\n');
+}
+
+export function taskListResult(pipelines: Pipeline[]): string {
+  const lines = [`Pipelines (${pipelines.length}):`];
+
+  for (const p of pipelines) {
+    const tasks = Object.values(p.tasks);
+    const done = tasks.filter((t) => t.state === 'done').length;
+    const active = tasks.filter((t) => t.state === 'claimed' || t.state === 'running').length;
+    const pending = tasks.filter((t) => t.state === 'pending').length;
+    const failed = tasks.filter((t) => t.state === 'failed').length;
+
+    lines.push('');
+    lines.push(`  [${p.state.toUpperCase()}] ${p.title} (ID: ${p.id})`);
+    lines.push(`    Tasks: ${done} done / ${active} active / ${pending} pending / ${failed} failed / ${tasks.length} total`);
+
+    for (const task of tasks) {
+      const icon = task.state === 'done' ? '+' : task.state === 'failed' ? '!' : task.state === 'claimed' ? '*' : '-';
+      const agent = task.assignee ? ` (${task.assignee})` : '';
+      const deps = task.dependsOn.length > 0 ? ` [deps: ${task.dependsOn.length}]` : '';
+      lines.push(`    [${icon}] ${task.title}${agent}${deps} — ${task.state}`);
+    }
+  }
+
+  return lines.join('\n');
 }

@@ -1,4 +1,4 @@
-// This file exposes the crosstalk server plugin and wires command handling, prompt injection, broadcast, and wake-ups.
+// This file exposes the crosstalk server plugin and wires command handling, prompt injection, broadcast, wake-ups, and pipeline tools.
 
 import type { Plugin, PluginModule } from '@opencode-ai/plugin';
 import { tool } from '@opencode-ai/plugin';
@@ -15,12 +15,17 @@ import {
   inboxResult,
   joinResult,
   normalizeMessage,
+  pipelineStatusResult,
+  questionBatchResult,
   statusResult,
   unknownRecipient,
   wakePrompt,
 } from './prompts';
 import {
+  advancePipeline,
   dropRoom,
+  getPendingQuestions,
+  getPipeline,
   getRoomView,
   handleReply,
   joinRoom,
@@ -45,6 +50,7 @@ import type {
   ToolContext,
 } from './types';
 import { getClient, getPoller, joined, setClient, setPoller, waking } from './memory';
+import { createPipelineTool, createTaskTool, createQuestionTool } from './tools';
 
 const POLL_INTERVAL_MS = 1500;
 const COMMAND_HANDLED = '__CROSSTALK_COMMAND_HANDLED__';
@@ -148,7 +154,9 @@ async function poll(): Promise<void> {
 function parseCommand(input: string):
   | { action?: undefined }
   | { action: 'drop' | 'status' | 'inbox' }
-  | { action: 'join'; name?: string; room?: string } {
+  | { action: 'join'; name?: string; room?: string }
+  | { action: 'pipeline'; subcommand: string; args: string }
+  | { action: 'unknown' } {
   const trimmed = input.trim();
   if (!trimmed) {
     return {};
@@ -166,8 +174,21 @@ function parseCommand(input: string):
     return { action: 'drop' };
   }
 
+  // Pipeline commands: /crosstalk pipeline status, /crosstalk pipeline questions, etc.
+  if (trimmed.startsWith('pipeline ')) {
+    const rest = trimmed.slice(9).trim();
+    const spaceIndex = rest.indexOf(' ');
+    const subcommand = spaceIndex >= 0 ? rest.slice(0, spaceIndex) : rest;
+    const args = spaceIndex >= 0 ? rest.slice(spaceIndex + 1).trim() : '';
+    return { action: 'pipeline', subcommand, args };
+  }
+
+  if (trimmed === 'pipeline') {
+    return { action: 'pipeline', subcommand: 'status', args: '' };
+  }
+
   if (!trimmed.startsWith('join')) {
-    return {};
+    return { action: 'unknown' };
   }
 
   const rest = trimmed.slice(4).trim();
@@ -343,18 +364,24 @@ const server: Plugin = async (ctx) => {
   return {
     tool: {
       broadcast: createBroadcastTool(client),
+      task: createTaskTool(),
+      pipeline: createPipelineTool(),
+      question: createQuestionTool(),
     },
 
     config: async (input: ConfigTransformOutput) => {
       input.command ??= {};
       input.command.crosstalk = {
-        description: 'Join or leave the crosstalk room',
+        description: 'Crosstalk: messaging, pipelines, and task coordination',
         template: '$ARGUMENTS',
       };
 
       const experimental = input.experimental || {};
       const tools = new Set(experimental.subagent_tools || []);
       tools.add('broadcast');
+      tools.add('task');
+      tools.add('pipeline');
+      tools.add('question');
       input.experimental = {
         ...experimental,
         subagent_tools: [...tools],
@@ -410,6 +437,77 @@ const server: Plugin = async (ctx) => {
           view.messages.map((message) => message.msgIndex),
         );
         await sendIgnoredMessage(client, input.sessionID, inboxResult(view.self.alias, view.room, view.messages));
+        throw new Error(COMMAND_HANDLED);
+      }
+
+      if (parsed.action === 'pipeline') {
+        const view = await getRoomView(input.sessionID);
+
+        if (parsed.subcommand === 'status') {
+          await sendIgnoredMessage(
+            client,
+            input.sessionID,
+            'Use pipeline(action="status") to view pipeline progress.',
+          );
+          throw new Error(COMMAND_HANDLED);
+        }
+
+        if (parsed.subcommand === 'questions') {
+          const { getPipelinesBySession } = await import('./room');
+          const pipelines = await getPipelinesBySession(input.sessionID);
+          const allQuestions = pipelines
+            .filter((p) => p.state === 'questions')
+            .flatMap((p) => p.questions.filter((q) => !q.answer));
+
+          if (allQuestions.length === 0) {
+            await sendIgnoredMessage(client, input.sessionID, 'No pending questions.');
+          } else {
+            await sendIgnoredMessage(client, input.sessionID, questionBatchResult(allQuestions));
+          }
+          throw new Error(COMMAND_HANDLED);
+        }
+
+        if (parsed.subcommand === 'list') {
+          const { getPipelinesBySession } = await import('./room');
+          const pipelines = await getPipelinesBySession(input.sessionID);
+
+          if (pipelines.length === 0) {
+            await sendIgnoredMessage(client, input.sessionID, 'No active pipelines. Create one with pipeline(action="create", ...).');
+            throw new Error(COMMAND_HANDLED);
+          }
+
+          const { taskListResult } = await import('./prompts');
+          await sendIgnoredMessage(client, input.sessionID, taskListResult(pipelines));
+          throw new Error(COMMAND_HANDLED);
+        }
+
+        if (parsed.subcommand === 'cancel' && parsed.args) {
+          const { getPipeline: getPipelineFn, updateTask: updateTaskFn } = await import('./room');
+          const pipeline = await getPipelineFn(parsed.args);
+          if (!pipeline) {
+            await sendIgnoredMessage(client, input.sessionID, `Pipeline ${parsed.args} not found.`);
+            throw new Error(COMMAND_HANDLED);
+          }
+          for (const task of Object.values(pipeline.tasks)) {
+            if (task.state !== 'done') {
+              await updateTaskFn(parsed.args, task.id, { state: 'failed', error: 'Pipeline cancelled' });
+            }
+          }
+          await advancePipeline(parsed.args);
+          await sendIgnoredMessage(client, input.sessionID, `Pipeline "${pipeline.title}" cancelled.`);
+          throw new Error(COMMAND_HANDLED);
+        }
+
+        await sendIgnoredMessage(
+          client,
+          input.sessionID,
+          'Usage: /crosstalk pipeline [status|questions|list|cancel <id>]',
+        );
+        throw new Error(COMMAND_HANDLED);
+      }
+
+      if (parsed.action === 'unknown') {
+        await sendIgnoredMessage(client, input.sessionID, JOIN_USAGE);
         throw new Error(COMMAND_HANDLED);
       }
 
