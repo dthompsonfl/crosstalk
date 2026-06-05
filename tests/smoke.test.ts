@@ -35,7 +35,7 @@ type QueueItem =
   | { type: 'text'; text: string }
   | { type: 'tool'; name: string; input: Record<string, unknown> };
 
-const CROSSTALK = '/home/spoon/code/ocplugins/crosstalk';
+const CROSSTALK = '/home/dylan/crosstalk';
 
 function sseLine(value: unknown) {
   return `data: ${JSON.stringify(value)}\n\n`;
